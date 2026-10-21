@@ -1,0 +1,44 @@
+spring:
+  application:
+    name: telco-charging-engine
+  threads:
+    virtual:
+      enabled: true
+
+server:
+  port: 8080
+  shutdown: graceful
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+    tags-sorter: alpha
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,threaddump
+
+telco:
+  charging:
+    lock-timeout: 200ms
+    session-ttl: 5m
+    reaper-interval: 5s
+    session-retention: 1h
+  pipeline:
+    buffer-capacity: 50000
+    workers: 4
+    offer-timeout: 500ms
+    batch-retention: 1h
+  campaign:
+    smsc-window-size: 50
+    smsc-min-latency: 20ms
+    smsc-max-latency: 120ms
+    smsc-failure-rate: 0.02
+    max-recipients: 100000
+  fraud:
+    max-events-per-minute: 30
+  seed:
+    enabled: true
