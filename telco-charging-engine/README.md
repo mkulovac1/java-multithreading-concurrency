@@ -68,7 +68,7 @@ The concurrent tests use a start gate (`CountDownLatch`) for maximum contention 
 ## Demo script (every feature, printed to the console)
 
 ```bash
-./scripts/demo.sh                      # all 13 sections, ~1 minute
+./scripts/demo.sh                      # all 13 sections, under a minute
 ./scripts/demo.sh --step               # section by section, you decide at every step
 ./scripts/demo.sh charging extend      # only some sections
 ./scripts/demo.sh --step cdr fraud     # step through only some sections
@@ -88,11 +88,11 @@ The script starts its own fresh instance on a free port (known demo data; reserv
 | 4 transfers | Me2U transfer, money conservation, same number, insufficient credit, suspended recipient |
 | 5 charging | reserve / commit / release with exact amounts, 60/60 vs 1/1 rounding, partial grant, 402, 409, 404 |
 | 6 extend | `extend` renews the deadline, expiry of a non-extended session, reaper, partial extension, 402 / 409 |
-| 7 cdr | batch rating, failures, failure-sample cap, usage aggregation, long polling, validation |
+| 7 cdr | batch rating, failures, failure-sample cap, usage aggregation, long polling, validation, and a **load of 200,000 CDRs** (20 x 10,000, 8 parallel clients, 100 subscribers) where every record must get exactly one outcome and the totals must add up |
 | 8 fraud | threshold of 30 events/min, one alert per window, far-future CDR, acknowledge |
-| 9 rerating | sequential vs parallel (speed-up, exact match), validation, "only one at a time" (503) |
-| 10 campaigns | 3000 messages with at most 50 in flight and ~30 threads, cancellation, accounting |
-| 11 concurrency | 60 parallel reservations, 60 opposite transfers (no deadlock), racing commit / release |
+| 9 rerating | **10,000,000 CDRs** (the maximum): sequential vs parallel (speed-up, exact match), validation, "only one at a time" (503) |
+| 10 campaigns | **100,000 messages** (the maximum) with at most 50 in flight and ~30 threads, cancellation, accounting |
+| 11 concurrency | **5,000** parallel reservations, **4,000** opposite transfers (no deadlock), **1,000** racing commit / release requests |
 | 12 errors | malformed JSON, bad parameters, 404 / 405 / 415 |
 | 13 metrics | counters from the previous sections, SMSC window never exceeded, graceful shutdown |
 

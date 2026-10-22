@@ -27,11 +27,11 @@ describe() {
     transfers)   echo "Me2U credit transfers, money conservation, rejected transfers" ;;
     charging)    echo "online charging: reserve, commit, release, rounding, partial grant" ;;
     extend)      echo "long calls: extend, expiry of a non-extended session, the reaper (takes ~7 s)" ;;
-    cdr)         echo "CDR mediation: batch rating, failures, usage aggregation, long polling" ;;
+    cdr)         echo "CDR mediation: batch rating, failures, usage aggregation, long polling, 200,000-CDR load" ;;
     fraud)       echo "fraud detection: 30 events/min threshold, alerts, far-future CDR" ;;
-    rerating)    echo "what-if re-rating: sequential vs parallel, only one at a time" ;;
-    campaigns)   echo "bulk SMS campaigns: SMPP window, virtual threads, cancellation" ;;
-    concurrency) echo "parallel requests: no overspending, no deadlock, exactly-once settlement" ;;
+    rerating)    echo "what-if re-rating of 10,000,000 CDRs: sequential vs parallel, only one at a time" ;;
+    campaigns)   echo "bulk SMS campaign to 100,000 numbers: SMPP window, virtual threads, cancellation" ;;
+    concurrency) echo "thousands of parallel requests: no overspending, no deadlock, exactly-once settlement" ;;
     errors)      echo "malformed JSON, bad parameters, 404 / 405 / 415" ;;
     metrics)     echo "monitoring counters from the sections that ran, graceful shutdown" ;;
   esac
@@ -127,6 +127,39 @@ elif cmd == "batch":
     n, msisdn, stype, units, when, prefix = sys.argv[2:8]
     print(json.dumps({"cdrs": [{"recordId": "%s-%d" % (prefix, i), "msisdn": msisdn, "serviceType": stype,
                                 "units": int(units), "eventTime": when} for i in range(int(n))]}))
+elif cmd == "cdrload":
+    import time
+    base, first, subs, batches, size, clients, when = sys.argv[2:9]
+    first, subs, batches, size, clients = int(first), int(subs), int(batches), int(size), int(clients)
+
+    def post(path, payload, timeout):
+        rq = urllib.request.Request(base + path, data=json.dumps(payload).encode(), method="POST",
+                                    headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(rq, timeout=timeout) as resp:
+                return resp.status, json.loads(resp.read(), parse_float=D)
+        except urllib.error.HTTPError as e:
+            return e.code, None
+
+    numbers = [str(first + i) for i in range(subs)]
+    with ThreadPoolExecutor(20) as ex:
+        list(ex.map(lambda n: post("/api/subscribers", {"msisdn": n, "name": "Load " + n, "tariffCode": "SMART",
+                                                        "initialBalance": 0}, 30), numbers))
+
+    def send(b):
+        cdrs = [{"recordId": "load-%d-%d" % (b, i), "msisdn": numbers[(b * size + i) % subs], "serviceType": "SMS",
+                 "units": 1, "eventTime": when} for i in range(size)]
+        return post("/api/cdrs/batches?waitMillis=30000", {"cdrs": cdrs}, 120)
+
+    started = time.time()
+    with ThreadPoolExecutor(int(clients)) as ex:
+        results = list(ex.map(send, range(batches)))
+    elapsed = time.time() - started
+    ok = [r for st, r in results if st == 202 and r]
+    print(json.dumps({"requests": batches, "sent": batches * size, "errors": batches - len(ok),
+                      "rated": sum(r["rated"] for r in ok), "failed": sum(r["failed"] for r in ok),
+                      "rejected": sum(r["rejected"] for r in ok), "revenue": str(sum(D(str(r["revenue"])) for r in ok)),
+                      "completed": sum(1 for r in ok if r["status"] == "COMPLETED"), "seconds": round(elapsed, 2)}))
 elif cmd == "par":
     base, spec, threads = sys.argv[2], sys.argv[3], int(sys.argv[4])
     reqs = [l.rstrip("\n").split("\t") for l in open(spec) if l.strip()]
@@ -581,6 +614,20 @@ s_cdr() {
   BID=$(jv batchId)
   req GET "/api/cdrs/batches/$BID?waitMillis=5000"
   expect_eq status COMPLETED "long poll returned the finished batch"
+  step "Load: 200,000 CDRs in 20 batches of 10,000 (the API maximum), 8 clients in parallel, 100 subscribers"
+  call GET /api/monitoring/metrics; local rated_before; rated_before=$(jv cdrPipeline.rated)
+  note "creating 100 subscribers and posting 20 x 10,000 CDRs (buffer 50,000, 4 rating workers) ..."
+  BODY=$(python3 "$PY" cdrload "$BASE" 38761990000 100 20 10000 8 "$NOW")
+  printf "    ${DIM}result: %s${RESET}\n" "$BODY"
+  expect_expr "j['errors'] == 0 and j['completed'] == 20" "all 20 requests were answered and every batch completed"
+  expect_expr "j['rated'] + j['failed'] + j['rejected'] == j['sent'] == 200000" "every one of the 200,000 records has exactly one outcome (rated $(jv rated), failed $(jv failed), rejected $(jv rejected))"
+  expect_expr "D(j['revenue']) == j['rated'] * D('0.05')" "revenue equals rated records x 0.05 (SMART SMS price), to the last decimal"
+  printf "    ${DIM}throughput: %s CDRs/s (%s s)${RESET}\n" "$(python3 "$PY" calc "round(200000 / D('$(jv seconds)'))")" "$(jv seconds)"
+  local rated_load; rated_load=$(jv rated)
+  call GET /api/monitoring/metrics
+  expect_val "$(python3 "$PY" calc "$(jv cdrPipeline.rated) - $rated_before")" "$rated_load" "pipeline counter grew by exactly the number of rated records"
+  req GET "/api/cdrs/usage/top?limit=100"
+  expect_expr "sum(u['cdrCount'] for u in j if u['msisdn'].startswith('387619900')) == $rated_load" "usage aggregated per subscriber adds up to the rated records (no lost updates)"
   step "Validation and unknown ids"
   req POST /api/cdrs/batches '{"cdrs":[]}'
   expect_status 400 "empty batch rejected"
@@ -642,14 +689,14 @@ s_rerating() {
   section "9. What-if re-rating: sequential vs parallel"
   local cpus threads; cpus=$(python3 "$PY" cpus); threads=4; [ "$cpus" -lt 2 ] && threads=2
   note "this machine reports $cpus cores; using $threads threads"
-  step "Re-rate 3,000,000 synthetic CDRs on SMART"
-  req POST /api/cdrs/rerating-simulations "{\"tariffCode\":\"SMART\",\"cdrCount\":3000000,\"threads\":$threads,\"seed\":42}"
+  step "Re-rate 10,000,000 synthetic CDRs (the maximum) on SMART"
+  req POST /api/cdrs/rerating-simulations "{\"tariffCode\":\"SMART\",\"cdrCount\":10000000,\"threads\":$threads,\"seed\":42}"
   expect_status 200 "simulation finished"
   expect_eq resultsMatch true "parallel total equals sequential total (exact integer arithmetic)"
   printf "    ${DIM}sequential %s ms, parallel %s ms, speed-up x%s${RESET}\n" "$(jv sequentialMillis)" "$(jv parallelMillis)" "$(jv speedup)"
   step "Same seed, same result: the simulation is deterministic"
   local first; first=$(jv totalRevenue)
-  call POST /api/cdrs/rerating-simulations "{\"tariffCode\":\"SMART\",\"cdrCount\":3000000,\"threads\":2,\"seed\":42}"
+  call POST /api/cdrs/rerating-simulations "{\"tariffCode\":\"SMART\",\"cdrCount\":10000000,\"threads\":2,\"seed\":42}"
   expect_val "$(jv totalRevenue)" "$first" "total revenue is identical with a different thread count"
   step "Validation"
   req POST /api/cdrs/rerating-simulations '{"tariffCode":"SMART","cdrCount":1000,"threads":0,"seed":1}'
@@ -689,9 +736,9 @@ s_campaigns() {
   else bad "small campaign did not complete in 10 s: $(trunc "$BODY")"; fi
   expect_expr "j['sent'] + j['failed'] == 3 and j['skipped'] == 0 and j['progressPercent'] == 100" "every message has an outcome (sent + failed = total)"
 
-  step "A 3000-number range: watch the window and the thread count while it runs"
-  req POST /api/campaigns '{"name":"Autumn promo","message":"Double data!","numberRange":{"firstMsisdn":"38761000000","count":3000}}'
-  expect_eq totalRecipients 3000 "range expanded to 3000 recipients"
+  step "A 100,000-number range (the maximum): watch the window and the thread count while it runs"
+  req POST /api/campaigns '{"name":"Autumn promo","message":"Double data!","numberRange":{"firstMsisdn":"38761000000","count":100000}}'
+  expect_eq totalRecipients 100000 "range expanded to 100,000 recipients"
   local BIG; BIG=$(jv campaignId)
   local i=0 max_in_flight=0 max_threads=0 v t
   while [ "$i" -lt 6 ]; do
@@ -705,15 +752,15 @@ s_campaigns() {
     i=$((i+1))
   done
   expect_expr "$max_in_flight > 0 and $max_in_flight <= 50" "in-flight messages never exceed the SMPP window (max seen: $max_in_flight)" 
-  expect_expr "$max_threads < 100" "3000 messages without 3000 platform threads (max live threads: $max_threads)"
+  expect_expr "$max_threads < 100" "100,000 messages without 100,000 platform threads (max live threads: $max_threads)"
 
   step "Cancel the running campaign"
   req DELETE "/api/campaigns/$BIG"
   expect_status 200 "cancel accepted"
   expect_eq status CANCELLED "status is CANCELLED"
-  if wait_for "/api/campaigns/$BIG" "j['sent']+j['failed']+j['skipped']==3000" 10; then
+  if wait_for "/api/campaigns/$BIG" "j['sent']+j['failed']+j['skipped']==100000" 60; then
     printf "    ${DIM}←${RESET} %s %s\n" "$STATUS" "$(trunc "$BODY")"
-    ok "every message accounted for after cancellation (sent + failed + skipped = 3000)"
+    ok "every message accounted for after cancellation (sent + failed + skipped = 100,000)"
   else bad "messages not fully accounted for: $(trunc "$BODY")"; fi
   expect_expr "j['skipped'] > 0" "unsent messages were skipped, not lost"
 
@@ -738,48 +785,48 @@ s_campaigns() {
 
 s_concurrency() {
   section "11. Concurrency: many simultaneous requests, invariants must hold"
-  step "60 parallel reservations of 1 SMS (0.05) on an account with 1.00 credit: at most 20 can succeed"
-  new_sub 38761999501 SMART 1.00 "Contended"
+  step "5,000 parallel reservations of 1 SMS (0.05) on an account with 50.00 credit: at most 1,000 can succeed"
+  new_sub 38761999501 SMART 50.00 "Contended"
   local spec="$WORK/spec1" n
   : > "$spec"
-  for n in $(seq 1 60); do
+  for n in $(seq 1 5000); do
     printf 'POST\t/api/charging/sessions\t{"msisdn":"38761999501","serviceType":"SMS","requestedUnits":1}\n' >> "$spec"
   done
-  BODY=$(python3 "$PY" par "$BASE" "$spec" 30)
+  BODY=$(python3 "$PY" par "$BASE" "$spec" 100)
   printf "    ${DIM}HTTP status counts: %s${RESET}\n" "$BODY"
   local granted; granted=$(jv 201); [ "$granted" = "null" ] && granted=0
-  expect_expr "$granted <= 20 and set(j) <= {'201','402','503'}" "at most 20 granted ($granted), the rest refused with 402 or 503"
+  expect_expr "$granted <= 1000 and set(j) <= {'201','402','503'}" "at most 1,000 granted ($granted), the rest refused with 402 or 503"
   sub_balance 38761999501
   expect_val "$(jv reservedAmount)" "$(dec "D('0.05') * $granted")" "reserved amount equals exactly granted x 0.05"
   expect_expr "j['availableBalance'] >= 0" "available balance never negative (no overspending)"
 
-  step "60 parallel transfers in opposite directions between two accounts (deadlock test)"
-  new_sub 38761999502 BASIC 100.00 "Account P"
-  new_sub 38761999503 BASIC 100.00 "Account Q"
+  step "4,000 parallel transfers in opposite directions between two accounts (deadlock test)"
+  new_sub 38761999502 BASIC 10000.00 "Account P"
+  new_sub 38761999503 BASIC 10000.00 "Account Q"
   : > "$spec"
-  for n in $(seq 1 30); do
+  for n in $(seq 1 2000); do
     printf 'POST\t/api/subscribers/transfers\t{"fromMsisdn":"38761999502","toMsisdn":"38761999503","amount":1.00}\n' >> "$spec"
     printf 'POST\t/api/subscribers/transfers\t{"fromMsisdn":"38761999503","toMsisdn":"38761999502","amount":1.00}\n' >> "$spec"
   done
-  BODY=$(python3 "$PY" par "$BASE" "$spec" 30)
+  BODY=$(python3 "$PY" par "$BASE" "$spec" 100)
   printf "    ${DIM}HTTP status counts: %s${RESET}\n" "$BODY"
   expect_expr "'error' not in j and set(j) <= {'200','503'}" "every request finished (no deadlock, no hung request)"
   sub_balance 38761999502; local p; p=$(jv balance)
   sub_balance 38761999503; local q; q=$(jv balance)
-  expect_val "$(dec "D('$p') + D('$q')")" 200 "total money is conserved (P + Q = 200.00)"
+  expect_val "$(dec "D('$p') + D('$q')")" 20000 "total money is conserved (P + Q = 20,000.00)"
 
-  step "20 parallel commits and releases of the same session: exactly one settles it"
+  step "1,000 parallel commits and releases of the same session: exactly one settles it"
   new_sub 38761999504 BASIC 10.00 "Settle race"
   call POST /api/charging/sessions '{"msisdn":"38761999504","serviceType":"SMS","requestedUnits":5}'
   local sid; sid=$(jv sessionId)
   : > "$spec"
-  for n in $(seq 1 10); do
+  for n in $(seq 1 500); do
     printf 'POST\t/api/charging/sessions/%s/commit\t{"usedUnits":5}\n' "$sid" >> "$spec"
     printf 'POST\t/api/charging/sessions/%s/release\t\n' "$sid" >> "$spec"
   done
-  BODY=$(python3 "$PY" par "$BASE" "$spec" 20)
+  BODY=$(python3 "$PY" par "$BASE" "$spec" 100)
   printf "    ${DIM}HTTP status counts: %s${RESET}\n" "$BODY"
-  expect_expr "j.get('200', 0) == 1 and j.get('409', 0) + j.get('503', 0) == 19" "exactly one request settled the session, the other 19 got 409 (or 503)"
+  expect_expr "j.get('200', 0) == 1 and j.get('409', 0) + j.get('503', 0) == 999" "exactly one request settled the session, the other 999 got 409 (or 503)"
   sub_balance 38761999504
   expect_eq reservedAmount 0 "reservation released exactly once"
   expect_expr "j['balance'] in (D('10'), D('9.6'))" "balance is either untouched (released) or charged once (9.60)"
@@ -854,10 +901,10 @@ kill "$APP_PID" 2>/dev/null
 wait "$APP_PID" 2>/dev/null
 APP_PID=""
 if grep -q "CDR pipeline stopped" "$LOG"; then ok "graceful shutdown: the CDR pipeline drained and stopped"; else bad "no graceful shutdown message in the log"; fi
-if grep -qE "^[0-9T:.+-]+ +(ERROR|WARN)" "$LOG" ; then
-  note "log lines at WARN/ERROR level (expected: fraud alerts and rejected requests are logged):"
-  grep -E "^[0-9T:.+-]+ +(ERROR)" "$LOG" | head -5
-fi
+warns=$(grep -cE "^[0-9T:.+-]+ +WARN" "$LOG")
+errors=$(grep -cE "^[0-9T:.+-]+ +ERROR" "$LOG")
+note "application log: $warns WARN lines (fraud alerts are logged at WARN), $errors ERROR lines"
+if [ "$errors" -gt 0 ]; then grep -E "^[0-9T:.+-]+ +ERROR" "$LOG" | head -5; fi
 
 TOTAL=$((PASS+FAIL))
 printf "\n${BOLD}━━━ Summary ━━━${RESET}\n"
