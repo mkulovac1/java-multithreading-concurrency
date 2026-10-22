@@ -2,8 +2,8 @@
 #
 # Telco Charging Engine - end-to-end demo / smoke test.
 #
-# Starts a fresh instance of the application (isolated, known demo data, short reservation validity so that
-# expiry can be demonstrated), exercises every feature over HTTP and prints each request, each response and a
+# Starts a fresh instance of the application (isolated, known demo data; section 6 starts a second one with a
+# short reservation validity so that expiry can be demonstrated), exercises every feature over HTTP and prints each request, each response and a
 # PASS/FAIL line for every expectation. Exit code is 0 only if every expectation held.
 #
 #   ./scripts/demo.sh                    run every section
@@ -26,7 +26,7 @@ describe() {
     subscribers) echo "subscribers: activation, top-up, tariff change, suspend, paging" ;;
     transfers)   echo "Me2U credit transfers, money conservation, rejected transfers" ;;
     charging)    echo "online charging: reserve, commit, release, rounding, partial grant" ;;
-    extend)      echo "long calls: extend, expiry of a non-extended session, the reaper (takes ~7 s)" ;;
+    extend)      echo "long calls: extend, expiry of a non-extended session, the reaper (own instance, takes ~25 s)" ;;
     cdr)         echo "CDR mediation: batch rating, failures, usage aggregation, long polling, 200,000-CDR load" ;;
     fraud)       echo "fraud detection: 30 events/min threshold, alerts, far-future CDR" ;;
     rerating)    echo "what-if re-rating of 10,000,000 CDRs: sequential vs parallel, only one at a time" ;;
@@ -65,6 +65,7 @@ LOG="$WORK/app.log"
 PY="$WORK/h.py"
 RESP="$WORK/resp"
 APP_PID=""
+PIDS=""
 PASS=0
 FAIL=0
 FAILED_LIST=""
@@ -117,6 +118,11 @@ elif cmd == "expr":
         print("error: %s" % e)
 elif cmd == "calc":
     print(eval(sys.argv[2]))
+elif cmd == "sleepuntil":
+    import time
+    delay = T(sys.argv[2]) + float(sys.argv[3]) - time.time()
+    if delay > 0:
+        time.sleep(delay)
 elif cmd == "port":
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -184,11 +190,20 @@ die() { printf "%s\n" "${RED}$*${RESET}" >&2; exit 2; }
 selected() { case " $SELECTED " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 ran() { case " $EXECUTED " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
+is_windows() { case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; *) return 1 ;; esac; }
+
+stop_app() { # pid - SIGTERM, wait up to 10 s, then SIGKILL
+  local pid="$1" i=0
+  [ -n "$pid" ] || return 0
+  kill "$pid" 2>/dev/null
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i+1)); done
+  kill -9 "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+}
+
 cleanup() {
-  if [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2>/dev/null; then
-    kill "$APP_PID" 2>/dev/null
-    wait "$APP_PID" 2>/dev/null
-  fi
+  local pid
+  for pid in $PIDS; do stop_app "$pid"; done
 }
 trap cleanup EXIT
 
@@ -252,7 +267,8 @@ batch_json() { python3 "$PY" batch "$@"; }
 sub_balance() { call GET "/api/subscribers/$1"; }
 
 # ---------------------------------------------------------------------------------------------- application
-start_app() {
+launch_app() { # session-ttl reaper-interval logfile   (empty = application defaults); sets BASE, APP_PID, LOG
+  LOG="$3"
   command -v java >/dev/null || die "java is required"
   command -v curl >/dev/null || die "curl is required"
   command -v python3 >/dev/null || die "python3 is required"
@@ -266,9 +282,12 @@ start_app() {
   fi
   local port; port=$(python3 "$PY" port)
   BASE="http://localhost:$port"
-  java -jar "$jar" --server.port="$port" --spring.main.banner-mode=off \
-       --telco.charging.session-ttl=4s --telco.charging.reaper-interval=1s >"$LOG" 2>&1 </dev/null &
+  local opts=(--server.port="$port" --spring.main.banner-mode=off)
+  [ -n "$1" ] && opts+=(--telco.charging.session-ttl="$1")
+  [ -n "$2" ] && opts+=(--telco.charging.reaper-interval="$2")
+  java -jar "$jar" "${opts[@]}" >"$LOG" 2>&1 </dev/null &
   APP_PID=$!
+  PIDS="$PIDS $APP_PID"
   local i=0
   while [ "$i" -lt 120 ]; do
     kill -0 "$APP_PID" 2>/dev/null || { cat "$LOG"; die "application exited during startup"; }
@@ -277,7 +296,6 @@ start_app() {
   done
   [ "$i" -lt 120 ] || die "application did not become healthy in 60 s (log: $LOG)"
   printf "${DIM}application: %s (pid %s), jar %s\nlog: %s${RESET}\n" "$BASE" "$APP_PID" "$(basename "$jar")" "$LOG"
-  note "reservation validity is 4 s and the reaper runs every 1 s in this demo, so that expiry can be shown quickly"
 }
 
 # ================================================================================================ sections
@@ -501,7 +519,19 @@ s_charging() {
 }
 
 s_extend() {
-  section "6. Long calls: extend, expiry and the reaper (reservation validity is 4 s here)"
+  section "6. Long calls: extend, expiry and the reaper (a separate instance, reservation validity 10 s)"
+  note "starting a second instance with 10 s reservation validity and a 1 s reaper, so that expiry can be shown quickly"
+  local main_base="$BASE" main_pid="$APP_PID" main_log="$LOG"
+  launch_app 10s 1s "$WORK/app-extend.log"
+  extend_scenario
+  step "Counters of this instance"
+  req GET /api/monitoring/metrics
+  expect_expr "j['charging']['extensions'] >= 2 and j['charging']['expirations'] >= 1" "extensions and the expiry were counted"
+  stop_app "$APP_PID"
+  BASE="$main_base"; APP_PID="$main_pid"; LOG="$main_log"
+}
+
+extend_scenario() {
   new_sub 38761999201 SMART 25.00 "Long call"
   local E=38761999201
   step "Two sessions of 10 SMS (0.50 each) start together"
@@ -511,8 +541,8 @@ s_extend() {
   req POST /api/charging/sessions "{\"msisdn\":\"$E\",\"serviceType\":\"SMS\",\"requestedUnits\":10}"
   local B; B=$(jv sessionId)
   local B_EXP; B_EXP=$(jv expiresAt)
-  note "waiting 1.5 s, then extending only session B ..."
-  sleep 1.5
+  note "waiting until 5 s after the sessions were created (their deadline is 10 s), then extending only session B ..."
+  python3 "$PY" sleepuntil "$A_EXP" -5
   step "Extend B by 10 units: reserves only the difference and renews the deadline"
   req POST "/api/charging/sessions/$B/extend" '{"additionalUnits":10}'
   expect_status 200 "extension accepted"
@@ -526,8 +556,8 @@ s_extend() {
   expect_status 400 "zero additional units rejected"
   req POST /api/charging/sessions/does-not-exist/extend '{"additionalUnits":1}'
   expect_status 404 "unknown session"
-  note "waiting until A has passed its original deadline while B is still valid ..."
-  sleep 3
+  note "waiting until A has passed its original deadline (B was extended by 5 s, so it is still valid) ..."
+  python3 "$PY" sleepuntil "$A_EXP" 0.5
   step "A was not extended: it has expired"
   req POST "/api/charging/sessions/$A/commit" '{"usedUnits":10}'
   expect_status 409 "commit after expiry rejected"
@@ -538,11 +568,11 @@ s_extend() {
   expect_status 200 "commit accepted"
   expect_eq chargedAmount 1 "20 SMS x 0.05 = 1.00"
   note "waiting for the reaper to close A ..."
-  if wait_for "/api/charging/sessions/$A" "j['status']=='EXPIRED'" 6; then
+  if wait_for "/api/charging/sessions/$A" "j['status']=='EXPIRED'" 15; then
     printf "    ${DIM}←${RESET} %s %s\n" "$STATUS" "$(trunc "$BODY")"
     ok "reaper closed session A as EXPIRED"
   else
-    bad "session A was not expired by the reaper within 6 s: $(trunc "$BODY")"
+    bad "session A was not expired by the reaper within 15 s: $(trunc "$BODY")"
   fi
   sub_balance $E
   expect_eq reservedAmount 0 "A's blocked credit was released"
@@ -856,7 +886,6 @@ s_metrics() {
   expect_status 200 "metrics snapshot"
   expect_eq cdrPipeline.running true "CDR pipeline is running"
   expect_expr "j['smsc']['maxInFlightObserved'] <= 50" "SMSC window was never exceeded (max in flight: $(jv smsc.maxInFlightObserved))"
-  ran extend && expect_expr "j['charging']['extensions'] >= 2 and j['charging']['expirations'] >= 1" "extensions and expirations were counted"
   ran charging && expect_expr "j['charging']['commits'] >= 4 and j['charging']['releases'] >= 2" "commits and releases were counted"
   ran cdr && expect_expr "j['cdrPipeline']['rated'] >= 3 and j['cdrPipeline']['failed'] >= 26" "CDRs rated and failed were counted"
   ran fraud && expect_expr "j['fraud']['alertsRaised'] >= 2" "fraud alerts were counted"
@@ -865,7 +894,8 @@ s_metrics() {
 
 # ================================================================================================ main
 printf "${BOLD}Telco Charging Engine - demo and end-to-end checks${RESET}\n"
-start_app
+launch_app "" "" "$LOG"
+note "reservation validity is the application default (5 min); section 6 starts its own instance with a short one"
 
 ask() { # section index total -> sets ANSWER (re-asks until the choice is valid)
   printf "\n${BOLD}Next section %s/%s: %s${RESET} - %s\n" "$2" "$3" "$1" "$(describe "$1")"
@@ -897,10 +927,15 @@ for s in $ALL_SECTIONS; do
 done
 
 section "Shutdown"
-kill "$APP_PID" 2>/dev/null
-wait "$APP_PID" 2>/dev/null
+stop_app "$APP_PID"
 APP_PID=""
-if grep -q "CDR pipeline stopped" "$LOG"; then ok "graceful shutdown: the CDR pipeline drained and stopped"; else bad "no graceful shutdown message in the log"; fi
+if is_windows; then
+  note "graceful shutdown is not verified on Windows: stopping a process there does not run the JVM shutdown hooks"
+elif grep -q "CDR pipeline stopped" "$LOG"; then
+  ok "graceful shutdown: the CDR pipeline drained and stopped"
+else
+  bad "no graceful shutdown message in the log"
+fi
 warns=$(grep -cE "^[0-9T:.+-]+ +WARN" "$LOG")
 errors=$(grep -cE "^[0-9T:.+-]+ +ERROR" "$LOG")
 note "application log: $warns WARN lines (fraud alerts are logged at WARN), $errors ERROR lines"

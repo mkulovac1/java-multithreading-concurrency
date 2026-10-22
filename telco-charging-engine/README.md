@@ -78,7 +78,7 @@ The concurrent tests use a start gate (`CountDownLatch`) for maximum contention 
 
 With `--step` the script stops before every section and asks: `[Enter]` run it, `[s]` skip it, `[a]` run all the remaining ones without asking, `[q]` quit (the application is still shut down cleanly and a summary is printed). After each section it prints how many checks passed. Every section creates its own subscribers, so the sections are independent and can be skipped or selected by name (they always run in the order of the list); each section can be run once per started instance (start the script again to repeat one). The monitoring section only asserts counters for the sections that actually ran.
 
-The script starts its own fresh instance on a free port (known demo data; reservation validity 4 s and a 1 s reaper, so expiry can be shown quickly), then calls the real HTTP API. For every step it prints the request, the response and a `✔` / `✘` line per expectation; it ends with a summary and exits with code 1 if anything failed. It needs `java`, `curl` and `python3` (and `mvn` only if the jar is missing).
+The script starts its own fresh instance on a free port (known demo data and the application's default settings), then calls the real HTTP API. For every step it prints the request, the response and a `✔` / `✘` line per expectation; it ends with a summary and exits with code 1 if anything failed. It needs `java`, `curl` and `python3` (and `mvn` only if the jar is missing). It also runs under Git Bash on Windows; there the graceful-shutdown check is skipped, because stopping a process on Windows does not run the JVM shutdown hooks. The few time-dependent steps (section 6) wait relative to the timestamps reported by the server, not for fixed periods, so a slow machine does not break them.
 
 | Section | What it shows |
 |---|---|
@@ -87,7 +87,7 @@ The script starts its own fresh instance on a free port (known demo data; reserv
 | 3 subscribers | activation, duplicates, top-up, tariff change, suspend, paging, validation |
 | 4 transfers | Me2U transfer, money conservation, same number, insufficient credit, suspended recipient |
 | 5 charging | reserve / commit / release with exact amounts, 60/60 vs 1/1 rounding, partial grant, 402, 409, 404 |
-| 6 extend | `extend` renews the deadline, expiry of a non-extended session, reaper, partial extension, 402 / 409 |
+| 6 extend | runs on its own second instance with 10 s reservation validity and a 1 s reaper, so expiry can be shown quickly: `extend` renews the deadline, a non-extended session expires and the reaper releases its credit, partial extension, 402 / 409 |
 | 7 cdr | batch rating, failures, failure-sample cap, usage aggregation, long polling, validation, and a **load of 200,000 CDRs** (20 x 10,000, 8 parallel clients, 100 subscribers) where every record must get exactly one outcome and the totals must add up |
 | 8 fraud | threshold of 30 events/min, one alert per window, far-future CDR, acknowledge |
 | 9 rerating | **10,000,000 CDRs** (the maximum): sequential vs parallel (speed-up, exact match), validation, "only one at a time" (503) |
