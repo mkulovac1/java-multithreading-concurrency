@@ -50,8 +50,11 @@ Demo data is loaded at startup: tariffs `BASIC`, `SMART`, `BUSINESS` and subscri
 ## Tests
 
 ```bash
-mvn test        # 58 tests: unit, concurrent stress tests, MockMvc integration
+mvn test        # 155 tests: unit, concurrent stress tests, MockMvc integration, JaCoCo report
+mvn verify      # the same, plus a build failure if line or branch coverage drops below 95%
 ```
+
+The coverage report is written to `target/site/jacoco/index.html` (the build enforces at least 95% of lines and branches, overall and per package).
 
 The concurrent tests use a start gate (`CountDownLatch`) for maximum contention and verify **invariants**:
 - money is conserved and there is no overdraft,
@@ -61,6 +64,33 @@ The concurrent tests use a start gate (`CountDownLatch`) for maximum contention 
 - no transfer completes after a suspension has returned,
 - exactly one fraud alert is raised per window,
 - the number of in-flight messages never exceeds the SMPP window.
+
+## Demo script (every feature, printed to the console)
+
+```bash
+./scripts/demo.sh                      # all 13 sections, ~1 minute
+./scripts/demo.sh charging extend      # only some sections
+./scripts/demo.sh --list               # section names
+./scripts/demo.sh --rebuild            # rebuild the jar first
+```
+
+The script starts its own fresh instance on a free port (known demo data; reservation validity 4 s and a 1 s reaper, so expiry can be shown quickly), then calls the real HTTP API. For every step it prints the request, the response and a `✔` / `✘` line per expectation; it ends with a summary and exits with code 1 if anything failed. It needs `java`, `curl` and `python3` (and `mvn` only if the jar is missing).
+
+| Section | What it shows |
+|---|---|
+| 1 health | health, OpenAPI document, demo tariffs and subscribers |
+| 2 tariffs | create / update / list, duplicates, validation (price cap 1000, increment 60 s), 404 |
+| 3 subscribers | activation, duplicates, top-up, tariff change, suspend, paging, validation |
+| 4 transfers | Me2U transfer, money conservation, same number, insufficient credit, suspended recipient |
+| 5 charging | reserve / commit / release with exact amounts, 60/60 vs 1/1 rounding, partial grant, 402, 409, 404 |
+| 6 extend | `extend` renews the deadline, expiry of a non-extended session, reaper, partial extension, 402 / 409 |
+| 7 cdr | batch rating, failures, failure-sample cap, usage aggregation, long polling, validation |
+| 8 fraud | threshold of 30 events/min, one alert per window, far-future CDR, acknowledge |
+| 9 rerating | sequential vs parallel (speed-up, exact match), validation, "only one at a time" (503) |
+| 10 campaigns | 3000 messages with at most 50 in flight and ~30 threads, cancellation, accounting |
+| 11 concurrency | 60 parallel reservations, 60 opposite transfers (no deadlock), racing commit / release |
+| 12 errors | malformed JSON, bad parameters, 404 / 405 / 415 |
+| 13 metrics | counters from the previous sections, SMSC window never exceeded, graceful shutdown |
 
 ## Demo scenarios (curl)
 
