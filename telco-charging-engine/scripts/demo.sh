@@ -7,26 +7,52 @@
 # PASS/FAIL line for every expectation. Exit code is 0 only if every expectation held.
 #
 #   ./scripts/demo.sh                    run every section
+#   ./scripts/demo.sh --step             go section by section: before each one choose
+#                                        [Enter] run, [s] skip, [a] run all remaining, [q] quit
 #   ./scripts/demo.sh charging extend    run only the named sections
+#   ./scripts/demo.sh --step cdr fraud   step through only the named sections
 #   ./scripts/demo.sh --rebuild          rebuild the jar first
-#   ./scripts/demo.sh --list             list sections
+#   ./scripts/demo.sh --list             list sections with a short description
 #
 # Requires: java 25, curl, python3 (and maven, only if the jar has to be built).
 
 ALL_SECTIONS="health tariffs subscribers transfers charging extend cdr fraud rerating campaigns concurrency errors metrics"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+describe() {
+  case "$1" in
+    health)      echo "health, OpenAPI document, demo tariffs and subscribers" ;;
+    tariffs)     echo "tariff catalog: create, update, list, validation, price cap" ;;
+    subscribers) echo "subscribers: activation, top-up, tariff change, suspend, paging" ;;
+    transfers)   echo "Me2U credit transfers, money conservation, rejected transfers" ;;
+    charging)    echo "online charging: reserve, commit, release, rounding, partial grant" ;;
+    extend)      echo "long calls: extend, expiry of a non-extended session, the reaper (takes ~7 s)" ;;
+    cdr)         echo "CDR mediation: batch rating, failures, usage aggregation, long polling" ;;
+    fraud)       echo "fraud detection: 30 events/min threshold, alerts, far-future CDR" ;;
+    rerating)    echo "what-if re-rating: sequential vs parallel, only one at a time" ;;
+    campaigns)   echo "bulk SMS campaigns: SMPP window, virtual threads, cancellation" ;;
+    concurrency) echo "parallel requests: no overspending, no deadlock, exactly-once settlement" ;;
+    errors)      echo "malformed JSON, bad parameters, 404 / 405 / 415" ;;
+    metrics)     echo "monitoring counters from the sections that ran, graceful shutdown" ;;
+  esac
+}
+
 REBUILD=0
+STEP=0
 SELECTED=""
 for arg in "$@"; do
   case "$arg" in
     --rebuild) REBUILD=1 ;;
-    --list) echo $ALL_SECTIONS; exit 0 ;;
-    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) SELECTED="$SELECTED $arg" ;;
+    --step|-s) STEP=1 ;;
+    --list) n=0; for s in $ALL_SECTIONS; do n=$((n+1)); printf "%2d  %-12s %s\n" "$n" "$s" "$(describe "$s")"; done; exit 0 ;;
+    -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
+    -*) echo "unknown option: $arg (see --help)" >&2; exit 2 ;;
+    *) case " $ALL_SECTIONS " in *" $arg "*) SELECTED="$SELECTED $arg" ;; *) echo "unknown section: $arg (see --list)" >&2; exit 2 ;; esac ;;
   esac
 done
 [ -z "$SELECTED" ] && SELECTED="$ALL_SECTIONS"
+EXECUTED=""
+SKIPPED=""
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; DIM=$'\033[2m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
@@ -122,7 +148,8 @@ elif cmd == "par":
 PYEOF
 
 die() { printf "%s\n" "${RED}$*${RESET}" >&2; exit 2; }
-ran() { case " $SELECTED " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+selected() { case " $SELECTED " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+ran() { case " $EXECUTED " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 cleanup() {
   if [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2>/dev/null; then
@@ -207,7 +234,7 @@ start_app() {
   local port; port=$(python3 "$PY" port)
   BASE="http://localhost:$port"
   java -jar "$jar" --server.port="$port" --spring.main.banner-mode=off \
-       --telco.charging.session-ttl=4s --telco.charging.reaper-interval=1s >"$LOG" 2>&1 &
+       --telco.charging.session-ttl=4s --telco.charging.reaper-interval=1s >"$LOG" 2>&1 </dev/null &
   APP_PID=$!
   local i=0
   while [ "$i" -lt 120 ]; do
@@ -792,8 +819,34 @@ s_metrics() {
 # ================================================================================================ main
 printf "${BOLD}Telco Charging Engine - demo and end-to-end checks${RESET}\n"
 start_app
+
+ask() { # section index total -> sets ANSWER (re-asks until the choice is valid)
+  printf "\n${BOLD}Next section %s/%s: %s${RESET} - %s\n" "$2" "$3" "$1" "$(describe "$1")"
+  while true; do
+    printf "  [Enter] run   [s] skip   [a] run all remaining   [q] quit > "
+    if ! read -r ANSWER; then ANSWER="q"; printf "\n"; note "no more input - quitting"; return; fi
+    case "$ANSWER" in ""|s|S|a|A|q|Q) return ;; esac
+    note "unknown choice '$ANSWER' - press Enter, s, a or q"
+  done
+}
+
+total=0; for s in $ALL_SECTIONS; do selected "$s" && total=$((total+1)); done
+idx=0; AUTO=0; STOPPED=0
 for s in $ALL_SECTIONS; do
-  if ran "$s"; then "s_$s"; fi
+  selected "$s" || continue
+  idx=$((idx+1))
+  if [ "$STEP" = 1 ] && [ "$AUTO" = 0 ]; then
+    ask "$s" "$idx" "$total"
+    case "$ANSWER" in
+      s|S) SKIPPED="$SKIPPED $s"; note "skipped $s"; continue ;;
+      a|A) AUTO=1 ;;
+      q|Q) STOPPED=1; break ;;
+    esac
+  fi
+  before_pass=$PASS; before_fail=$FAIL
+  "s_$s"
+  EXECUTED="$EXECUTED $s"
+  printf "\n  ${DIM}section %s: %d checks passed, %d failed${RESET}\n" "$s" $((PASS-before_pass)) $((FAIL-before_fail))
 done
 
 section "Shutdown"
@@ -808,6 +861,9 @@ fi
 
 TOTAL=$((PASS+FAIL))
 printf "\n${BOLD}━━━ Summary ━━━${RESET}\n"
+printf "sections run:%s\n" "${EXECUTED:- none}"
+[ -n "$SKIPPED" ] && printf "sections skipped:%s\n" "$SKIPPED"
+[ "$STOPPED" = 1 ] && printf "${YELLOW}stopped early at your request${RESET}\n"
 if [ "$FAIL" -eq 0 ]; then
   printf "${GREEN}${BOLD}ALL %d CHECKS PASSED${RESET}\n" "$TOTAL"
 else

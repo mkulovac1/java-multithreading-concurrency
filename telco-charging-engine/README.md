@@ -69,10 +69,14 @@ The concurrent tests use a start gate (`CountDownLatch`) for maximum contention 
 
 ```bash
 ./scripts/demo.sh                      # all 13 sections, ~1 minute
+./scripts/demo.sh --step               # section by section, you decide at every step
 ./scripts/demo.sh charging extend      # only some sections
-./scripts/demo.sh --list               # section names
+./scripts/demo.sh --step cdr fraud     # step through only some sections
+./scripts/demo.sh --list               # numbered sections with a description
 ./scripts/demo.sh --rebuild            # rebuild the jar first
 ```
+
+With `--step` the script stops before every section and asks: `[Enter]` run it, `[s]` skip it, `[a]` run all the remaining ones without asking, `[q]` quit (the application is still shut down cleanly and a summary is printed). After each section it prints how many checks passed. Every section creates its own subscribers, so the sections are independent and can be skipped or selected by name (they always run in the order of the list); each section can be run once per started instance (start the script again to repeat one). The monitoring section only asserts counters for the sections that actually ran.
 
 The script starts its own fresh instance on a free port (known demo data; reservation validity 4 s and a 1 s reaper, so expiry can be shown quickly), then calls the real HTTP API. For every step it prints the request, the response and a `✔` / `✘` line per expectation; it ends with a summary and exits with code 1 if anything failed. It needs `java`, `curl` and `python3` (and `mvn` only if the jar is missing).
 
